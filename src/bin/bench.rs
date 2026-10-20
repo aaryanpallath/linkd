@@ -3,7 +3,7 @@
 use std::fmt::Write as _;
 
 use linkd::endpoint::Config;
-use linkd::frame::Precedence;
+use linkd::frame::{LinkKey, Precedence};
 use linkd::sim::{LinkParams, Message, Report, percentile, run};
 
 const RADIO: LinkParams = LinkParams {
@@ -92,26 +92,27 @@ fn main() {
         "{:<34} {:>9} {:>6} {:>6} {:>8} {:>9} {:>11}",
         "scenario", "delivered", "twice", "bad", "retrans", "rejected", "goodput B/s"
     );
-    for (name, link) in [
-        ("clean", RADIO.clone()),
-        (
-            "loss_10pct",
-            LinkParams {
-                loss: 0.10,
-                ..RADIO.clone()
-            },
-        ),
-        (
-            "contested_30pct_loss",
-            LinkParams {
-                loss: 0.30,
-                duplicate: 0.05,
-                corrupt: 0.02,
-                ..RADIO.clone()
-            },
-        ),
+    let authed = Config {
+        key: Some(LinkKey::new([7; 32])),
+        ..Config::default()
+    };
+    let contested = LinkParams {
+        loss: 0.30,
+        duplicate: 0.05,
+        corrupt: 0.02,
+        ..RADIO.clone()
+    };
+    let loss_10 = LinkParams {
+        loss: 0.10,
+        ..RADIO.clone()
+    };
+    for (name, link, c) in [
+        ("clean", RADIO.clone(), &cfg),
+        ("loss_10pct", loss_10, &cfg),
+        ("contested_30pct_loss", contested.clone(), &cfg),
+        ("contested_30pct_loss_authenticated", contested, &authed),
     ] {
-        let r = run(&cfg, &link, &steady(2000, 50), 2026, 7_200_000);
+        let r = run(c, &link, &steady(2000, 50), 2026, 7_200_000);
         println!(
             "{:<34} {:>9} {:>6} {:>6} {:>8} {:>9} {:>11.0}",
             name,

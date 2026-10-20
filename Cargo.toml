@@ -2,10 +2,12 @@
 name = "linkd"
 version = "0.1.0"
 edition = "2024"
-description = "Reliable, precedence-aware messaging over lossy tactical links: sans-IO protocol core, deterministic simulator, UDP runtime"
+description = "Reliable, precedence-aware, authenticated messaging over lossy tactical links: sans-IO protocol core, deterministic simulator, UDP runtime"
 license = "MIT"
 
 [dependencies]
+hmac = "0.13"
+sha2 = "0.11"
 
 [[bin]]
 name = "linkd-bench"

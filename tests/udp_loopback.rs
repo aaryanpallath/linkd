@@ -8,7 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use linkd::endpoint::Config;
-use linkd::frame::Precedence;
+use linkd::frame::{Frame, LinkKey, Precedence};
 use linkd::rng::Rng;
 use linkd::udp::UdpLink;
 
@@ -18,7 +18,8 @@ fn free_addr() -> SocketAddr {
         .unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap_or_else(|_| unreachable!()))
 }
 
-/// Forward datagrams between a and b, dropping 20%, corrupting 2% and duplicating 3% of them.
+/// Forward datagrams between a and b, dropping 20%, corrupting 2% and duplicating 3% of them, and acting as an
+/// attacker on the path: it also injects forged FLASH frames (correct format and CRC, but no key).
 fn proxy(
     listen_a: SocketAddr,
     listen_b: SocketAddr,
@@ -48,20 +49,33 @@ fn proxy(
                 for _ in 0..copies {
                     let _ = to_sock.send_to(&d, to);
                 }
+                if rng.unit() < 0.05 {
+                    let forged = Frame::data(
+                        rng.next_u64(),
+                        rng.below(64),
+                        Precedence::Flash,
+                        b"FORGED".to_vec(),
+                    );
+                    if let Ok(bytes) = forged.encode(None) {
+                        let _ = to_sock.send_to(&bytes, to);
+                    }
+                }
             }
         }
     }
 }
 
 #[test]
-fn messages_cross_a_lossy_udp_link_exactly_once_and_intact() {
+fn messages_cross_a_lossy_hostile_udp_link_exactly_once_intact_and_authentic() {
     let (a, b, pa, pb) = (free_addr(), free_addr(), free_addr(), free_addr());
     let stop = Arc::new(AtomicBool::new(false));
     let s2 = stop.clone();
     let px = thread::spawn(move || proxy(pa, pb, a, b, s2));
+    let key = LinkKey::new(*b"pre-shared key for the test link");
     let cfg = Config {
         rto_initial_ms: 50,
         rto_min_ms: 20,
+        key: Some(key),
         ..Config::default()
     };
     let left = UdpLink::spawn(a, pa, cfg.clone()).unwrap_or_else(|e| panic!("{e}"));
@@ -82,6 +96,7 @@ fn messages_cross_a_lossy_udp_link_exactly_once_and_intact() {
     let deadline = Instant::now() + Duration::from_secs(60);
     while got.len() < n as usize && Instant::now() < deadline {
         if let Some((_, p)) = right.recv_timeout(Duration::from_millis(50)) {
+            assert_ne!(p, b"FORGED".to_vec(), "a forged frame was delivered");
             let id = u32::from_be_bytes([p[0], p[1], p[2], p[3]]);
             assert!(
                 p[4..].iter().all(|&x| x == (id % 251) as u8),

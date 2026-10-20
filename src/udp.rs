@@ -9,7 +9,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::endpoint::{Config, Endpoint, Stats};
-use crate::frame::{HEADER_LEN, MAX_PAYLOAD, Precedence};
+use crate::frame::{MAX_FRAME, Precedence};
 
 pub struct UdpLink {
     outbox: Sender<(Vec<u8>, Precedence)>,
@@ -33,7 +33,7 @@ impl UdpLink {
                 let start = Instant::now();
                 let now = || start.elapsed().as_millis() as u64;
                 let mut ep = Endpoint::new(cfg);
-                let mut buf = vec![0u8; HEADER_LEN + MAX_PAYLOAD + 4];
+                let mut buf = vec![0u8; MAX_FRAME + 1]; // +1 so an oversized datagram is detected, not silently truncated
                 while !flag.load(Ordering::Relaxed) {
                     while let Ok((payload, precedence)) = app_out.try_recv() {
                         let _ = ep.send(payload, precedence);

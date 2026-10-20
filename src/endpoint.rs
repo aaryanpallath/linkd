@@ -2,8 +2,17 @@
 //! the current time, and ask it what to transmit next. The same code runs in the simulator and over UDP.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::frame::{Frame, FrameError, Kind, MAX_PAYLOAD, Precedence};
+use crate::frame::{Frame, FrameError, Kind, LinkKey, MAX_PAYLOAD, Precedence};
+use crate::rng::Rng;
+
+/// Frames are accepted only with sequence numbers in [base, base + RECV_WINDOW), which bounds receiver state and
+/// must exceed the largest sender window plus the 32-frame selective-ack span.
+pub const RECV_WINDOW: u32 = 64;
+/// Previous peer sessions remembered so their frames can never be replayed into a newer session.
+const RETIRED_SESSIONS: usize = 64;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -16,6 +25,11 @@ pub struct Config {
     pub max_attempts: u32,
     /// Ablation switch: ignore precedence and send strictly first-in, first-out.
     pub fifo: bool,
+    /// Pre-shared link key. With a key every frame is authenticated (HMAC-SHA256); without one, frames carry only a
+    /// CRC, which detects accidental corruption but not a deliberate forgery.
+    pub key: Option<LinkKey>,
+    /// This endpoint's session id; `None` picks a fresh one. It only needs to be unique, not secret.
+    pub session: Option<u64>,
 }
 
 impl Default for Config {
@@ -27,13 +41,33 @@ impl Default for Config {
             rto_max_ms: 8000,
             max_attempts: 12,
             fifo: false,
+            key: None,
+            session: None,
         }
     }
+}
+
+fn fresh_session() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    Rng::new(nanos ^ (std::process::id() as u64) << 32 ^ COUNTER.fetch_add(1, Ordering::Relaxed))
+        .next_u64()
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum SendError {
     PayloadTooLarge(usize),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Rejected {
+    Frame(FrameError),
+    StaleSession,
+    OutsideWindow,
+    AckBeyondSent,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -56,12 +90,15 @@ struct InFlight {
 
 pub struct Endpoint {
     cfg: Config,
+    session: u64,
     next_seq: u32,
     queues: [VecDeque<(Precedence, Vec<u8>)>; 4],
     inflight: BTreeMap<u32, InFlight>,
     srtt: Option<f64>,
     rttvar: f64,
     rto: u64,
+    peer_session: Option<u64>,
+    retired_sessions: VecDeque<u64>,
     recv_base: u32,
     recv_seen: BTreeSet<u32>,
     ack_pending: bool,
@@ -73,14 +110,18 @@ pub struct Endpoint {
 impl Endpoint {
     pub fn new(cfg: Config) -> Self {
         let rto = cfg.rto_initial_ms;
+        let session = cfg.session.unwrap_or_else(fresh_session);
         Endpoint {
             cfg,
+            session,
             next_seq: 0,
             queues: Default::default(),
             inflight: BTreeMap::new(),
             srtt: None,
             rttvar: 0.0,
             rto,
+            peer_session: None,
+            retired_sessions: VecDeque::new(),
             recv_base: 0,
             recv_seen: BTreeSet::new(),
             ack_pending: false,
@@ -92,6 +133,10 @@ impl Endpoint {
 
     pub fn rto_ms(&self) -> u64 {
         self.rto
+    }
+
+    pub fn session(&self) -> u64 {
+        self.session
     }
 
     /// Queue a message. FLASH traffic is transmitted before any lower precedence (unless `fifo` is set).
@@ -122,27 +167,58 @@ impl Endpoint {
         self.inflight.is_empty() && self.queues.iter().all(VecDeque::is_empty) && !self.ack_pending
     }
 
-    /// Process bytes received from the network. Corrupt or malformed frames are counted and dropped.
-    pub fn handle(&mut self, bytes: &[u8], now: u64) -> Result<(), FrameError> {
-        let frame = match Frame::decode(bytes) {
-            Ok(f) => f,
-            Err(e) => {
-                self.stats.frames_rejected += 1;
-                return Err(e);
-            }
-        };
-        match frame.kind {
-            Kind::Data => self.on_data(frame),
-            Kind::Ack => self.on_ack(frame.ack, frame.sack, now),
+    /// Process bytes received from the network. Corrupt, forged, replayed or out-of-window frames are counted and
+    /// dropped before they can change any state.
+    pub fn handle(&mut self, bytes: &[u8], now: u64) -> Result<(), Rejected> {
+        let result = Frame::decode(bytes, self.cfg.key.as_ref())
+            .map_err(Rejected::Frame)
+            .and_then(|f| self.accept_session(&f).map(|()| f))
+            .and_then(|f| match f.kind {
+                Kind::Data => self.on_data(f),
+                Kind::Ack => self.on_ack(f.ack, f.sack, now),
+            });
+        if result.is_err() {
+            self.stats.frames_rejected += 1;
         }
-        Ok(())
+        result
     }
 
-    fn on_data(&mut self, f: Frame) {
-        self.ack_pending = true; // always acknowledge, even duplicates: the earlier ack may have been lost
+    /// Lock onto the peer's session. A new session is accepted only through a fresh data frame with sequence number
+    /// 0 (a peer restart), and a session once replaced is never accepted again, so recorded frames cannot be replayed.
+    fn accept_session(&mut self, f: &Frame) -> Result<(), Rejected> {
+        match self.peer_session {
+            None => {
+                self.peer_session = Some(f.session);
+                Ok(())
+            }
+            Some(s) if s == f.session => Ok(()),
+            Some(old) => {
+                let restart = f.kind == Kind::Data
+                    && f.seq == 0
+                    && !self.retired_sessions.contains(&f.session);
+                if !restart {
+                    return Err(Rejected::StaleSession);
+                }
+                if self.retired_sessions.len() == RETIRED_SESSIONS {
+                    self.retired_sessions.pop_front();
+                }
+                self.retired_sessions.push_back(old);
+                self.peer_session = Some(f.session);
+                self.recv_base = 0;
+                self.recv_seen.clear();
+                Ok(())
+            }
+        }
+    }
+
+    fn on_data(&mut self, f: Frame) -> Result<(), Rejected> {
+        if f.seq >= self.recv_base.saturating_add(RECV_WINDOW) {
+            return Err(Rejected::OutsideWindow); // no legitimate sender can be this far ahead
+        }
+        self.ack_pending = true; // acknowledge duplicates too: the earlier ack may have been lost
         if f.seq < self.recv_base || self.recv_seen.contains(&f.seq) {
             self.stats.duplicates_suppressed += 1;
-            return;
+            return Ok(());
         }
         self.recv_seen.insert(f.seq);
         while self.recv_seen.remove(&self.recv_base) {
@@ -150,9 +226,13 @@ impl Endpoint {
         }
         self.stats.delivered += 1;
         self.delivered.push_back((f.precedence, f.payload));
+        Ok(())
     }
 
-    fn on_ack(&mut self, ack: u32, sack: u32, now: u64) {
+    fn on_ack(&mut self, ack: u32, sack: u32, now: u64) -> Result<(), Rejected> {
+        if ack > self.next_seq {
+            return Err(Rejected::AckBeyondSent); // acknowledges frames that were never sent
+        }
         let mut acked: Vec<u32> = self.inflight.range(..ack).map(|(s, _)| *s).collect();
         for i in 0..32u32 {
             if sack & (1 << i) != 0 {
@@ -167,6 +247,7 @@ impl Endpoint {
                 self.rtt_sample(now.saturating_sub(f.first_sent) as f64);
             }
         }
+        Ok(())
     }
 
     /// RFC 6298 estimator: SRTT, RTTVAR, RTO = SRTT + 4 * RTTVAR, clamped.
@@ -195,6 +276,10 @@ impl Endpoint {
         self.inflight.values().map(|f| self.deadline(f)).min()
     }
 
+    fn encode(&self, f: &Frame) -> Option<Vec<u8>> {
+        f.encode(self.cfg.key.as_ref()).ok()
+    }
+
     /// The next frame to put on the wire, if any: acks first, then due retransmissions and new data, each by
     /// precedence. Callers pace calls to the link rate.
     pub fn poll_transmit(&mut self, now: u64) -> Option<Vec<u8>> {
@@ -207,7 +292,7 @@ impl Endpoint {
                     sack |= 1 << i;
                 }
             }
-            return Frame::ack(self.recv_base, sack).encode().ok();
+            return self.encode(&Frame::ack(self.session, self.recv_base, sack));
         }
         // due retransmissions, highest precedence first; frames out of attempts are reported as failed
         loop {
@@ -242,7 +327,8 @@ impl Endpoint {
                 f.attempts += 1;
                 f.last_sent = now;
                 self.stats.retransmissions += 1;
-                return f.frame.encode().ok();
+                let frame = f.frame.clone();
+                return self.encode(&frame);
             }
         }
         if (self.inflight.len() as u32) < self.cfg.window
@@ -251,8 +337,8 @@ impl Endpoint {
         {
             let seq = self.next_seq;
             self.next_seq += 1;
-            let frame = Frame::data(seq, precedence, payload);
-            let bytes = frame.encode().ok();
+            let frame = Frame::data(self.session, seq, precedence, payload);
+            let bytes = self.encode(&frame);
             self.inflight.insert(
                 seq,
                 InFlight {
@@ -280,17 +366,29 @@ mod tests {
         )
     }
 
+    fn keyed(b: u8) -> Config {
+        Config {
+            key: Some(LinkKey::new([b; 32])),
+            ..Config::default()
+        }
+    }
+
+    fn tx(e: &mut Endpoint, now: u64) -> Result<Vec<u8>, Rejected> {
+        e.poll_transmit(now)
+            .ok_or(Rejected::Frame(FrameError::TooShort))
+    }
+
     #[test]
-    fn delivers_and_acknowledges() -> Result<(), FrameError> {
+    fn delivers_and_acknowledges() -> Result<(), Rejected> {
         let (mut a, mut b) = pair();
         assert_eq!(a.send(b"hello".to_vec(), Precedence::Routine), Ok(()));
-        let data = a.poll_transmit(0).ok_or(FrameError::TooShort)?;
+        let data = tx(&mut a, 0)?;
         b.handle(&data, 50)?;
         assert_eq!(
             b.poll_delivered(),
             Some((Precedence::Routine, b"hello".to_vec()))
         );
-        let ack = b.poll_transmit(50).ok_or(FrameError::TooShort)?;
+        let ack = tx(&mut b, 50)?;
         a.handle(&ack, 100)?;
         assert!(a.is_idle());
         assert_eq!(a.rto_ms(), 300); // RFC 6298 first sample: 100 + 4 * 50, above the 200 ms floor
@@ -298,25 +396,25 @@ mod tests {
     }
 
     #[test]
-    fn flash_jumps_the_queue() -> Result<(), FrameError> {
+    fn flash_jumps_the_queue() -> Result<(), Rejected> {
         let (mut a, _) = pair();
         for i in 0..5u8 {
             let _ = a.send(vec![i], Precedence::Routine);
         }
         let _ = a.send(b"flash".to_vec(), Precedence::Flash);
-        let first = Frame::decode(&a.poll_transmit(0).ok_or(FrameError::TooShort)?)?;
+        let first = Frame::decode(&tx(&mut a, 0)?, None).map_err(Rejected::Frame)?;
         assert_eq!(first.precedence, Precedence::Flash);
         Ok(())
     }
 
     #[test]
     fn lost_frames_are_retransmitted_after_the_timeout_and_duplicates_suppressed()
-    -> Result<(), FrameError> {
+    -> Result<(), Rejected> {
         let (mut a, mut b) = pair();
         let _ = a.send(b"x".to_vec(), Precedence::Priority);
-        let first = a.poll_transmit(0).ok_or(FrameError::TooShort)?; // pretend this one is lost
+        let first = tx(&mut a, 0)?; // pretend this one is lost
         assert!(a.poll_transmit(500).is_none()); // not yet due (initial RTO 1000 ms)
-        let again = a.poll_transmit(1000).ok_or(FrameError::TooShort)?;
+        let again = tx(&mut a, 1000)?;
         assert_eq!(a.stats.retransmissions, 1);
         b.handle(&again, 1050)?;
         b.handle(&first, 1060)?; // the "lost" copy arrives late
@@ -361,5 +459,82 @@ mod tests {
             a.send(vec![0; MAX_PAYLOAD + 1], Precedence::Routine),
             Err(SendError::PayloadTooLarge(MAX_PAYLOAD + 1))
         );
+    }
+
+    // ------------------------------------------------------------------ security
+    #[test]
+    fn forged_frames_never_change_state_on_an_authenticated_link() -> Result<(), Rejected> {
+        let (mut a, mut b) = (Endpoint::new(keyed(1)), Endpoint::new(keyed(1)));
+        let _ = a.send(b"real".to_vec(), Precedence::Routine);
+        b.handle(&tx(&mut a, 0)?, 10)?;
+        // an attacker who knows the format and the session, but not the key
+        let forged = Frame::data(a.session(), 1, Precedence::Flash, b"fake order".to_vec());
+        let no_key = forged.encode(None).map_err(Rejected::Frame)?;
+        let wrong_key = forged
+            .encode(Some(&LinkKey::new([2; 32])))
+            .map_err(Rejected::Frame)?;
+        assert!(b.handle(&no_key, 20).is_err());
+        assert!(b.handle(&wrong_key, 20).is_err());
+        assert_eq!(b.stats.delivered, 1);
+        assert_eq!(b.poll_delivered().map(|m| m.1), Some(b"real".to_vec()));
+        assert!(b.poll_delivered().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn spoofed_ack_for_unsent_frames_is_ignored() -> Result<(), Rejected> {
+        let mut a = Endpoint::new(Config::default());
+        for i in 0..3u8 {
+            let _ = a.send(vec![i], Precedence::Routine);
+            let _ = tx(&mut a, 0)?;
+        }
+        let peer = 99;
+        let bogus = Frame::ack(peer, 1_000, 0)
+            .encode(None)
+            .map_err(Rejected::Frame)?;
+        assert_eq!(a.handle(&bogus, 10), Err(Rejected::AckBeyondSent));
+        assert!(!a.is_idle()); // the three frames are still awaiting acknowledgement
+        Ok(())
+    }
+
+    #[test]
+    fn frames_far_ahead_are_rejected_and_state_stays_bounded() -> Result<(), Rejected> {
+        let mut b = Endpoint::new(Config::default());
+        let s = 7;
+        // after seq 0 is accepted the window is [1, 1 + RECV_WINDOW): the first sequence number outside it is 65
+        for seq in [0, RECV_WINDOW + 1, 1_000_000, u32::MAX] {
+            let bytes = Frame::data(s, seq, Precedence::Routine, vec![1])
+                .encode(None)
+                .map_err(Rejected::Frame)?;
+            let r = b.handle(&bytes, 0);
+            assert_eq!(r.is_ok(), seq == 0, "seq {seq}");
+        }
+        assert_eq!(b.stats.delivered, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn frames_from_a_replaced_session_cannot_be_replayed() -> Result<(), Rejected> {
+        let key = keyed(5);
+        let mut b = Endpoint::new(key.clone());
+        let mut old = Endpoint::new(Config {
+            session: Some(1),
+            ..key.clone()
+        });
+        let _ = old.send(b"old message".to_vec(), Precedence::Routine);
+        let recorded = tx(&mut old, 0)?;
+        b.handle(&recorded, 1)?;
+        // the peer restarts with a new session; its first frame (seq 0) is accepted
+        let mut new = Endpoint::new(Config {
+            session: Some(2),
+            ..key
+        });
+        let _ = new.send(b"new message".to_vec(), Precedence::Routine);
+        b.handle(&tx(&mut new, 10)?, 11)?;
+        // replaying the recorded frame from the old session is refused, even though its tag is valid
+        assert_eq!(b.handle(&recorded, 20), Err(Rejected::StaleSession));
+        let got: Vec<Vec<u8>> = std::iter::from_fn(|| b.poll_delivered().map(|m| m.1)).collect();
+        assert_eq!(got, vec![b"old message".to_vec(), b"new message".to_vec()]);
+        Ok(())
     }
 }
