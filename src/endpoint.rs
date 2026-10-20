@@ -46,15 +46,23 @@ impl Default for Config {
     }
 }
 
-/// Milliseconds since the epoch in the high 40 bits, random low bits, and strictly increasing within a process.
+/// Low bits of a session id that are random; the 44 bits above hold milliseconds since the epoch, which lasts until
+/// the year 2527 without overflowing.
+const SESSION_RANDOM_BITS: u32 = 20;
+
+/// A timestamp-ordered session id, strictly increasing within a process. Ordering across restarts relies on the
+/// node's clock (GPS-disciplined on a tactical radio); a clock that steps backwards fails closed: the peer refuses the
+/// new session until the clock passes the old one.
 fn fresh_session() -> u64 {
     static LAST: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
+        .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let random = Rng::new(nanos ^ (std::process::id() as u64) << 32).next_u64() & 0xFF_FFFF;
-    let candidate = (nanos / 1_000_000) << 24 | random;
+    let millis = (nanos / 1_000_000) as u64 & ((1 << (64 - SESSION_RANDOM_BITS)) - 1);
+    let random = Rng::new(nanos as u64 ^ (std::process::id() as u64) << 32).next_u64()
+        & ((1 << SESSION_RANDOM_BITS) - 1);
+    let candidate = millis << SESSION_RANDOM_BITS | random;
     let prev = LAST.fetch_max(candidate, Ordering::Relaxed);
     if candidate > prev {
         candidate
@@ -604,5 +612,12 @@ mod tests {
     fn fresh_sessions_strictly_increase() {
         let ids: Vec<u64> = (0..1000).map(|_| fresh_session()).collect();
         assert!(ids.windows(2).all(|w| w[0] < w[1]));
+        // the timestamp survives intact (an earlier version shifted it out of the top of the u64)
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let stamped = ids[0] >> SESSION_RANDOM_BITS;
+        assert!(now_ms.abs_diff(stamped) < 60_000, "{stamped} vs {now_ms}");
     }
 }

@@ -54,7 +54,8 @@ acknowledge frames that never arrived. With a pre-shared 256-bit link key (`Conf
 Out of scope: key exchange and rotation (keys are provisioned out of band), confidentiality (payloads are
 authenticated, not encrypted), and denial of service by jamming. Anti-replay state lives in memory, so a receiver
 that has just restarted will accept the first old session it hears; closing that gap needs a nonce handshake or
-persisted state, which is the next step.
+persisted state, which is the next step. Session ordering also relies on each node's clock (GPS time on a tactical
+radio); a clock that steps backwards fails closed, with the peer refusing the restarted node until its clock catches up.
 
 ## Design
 
