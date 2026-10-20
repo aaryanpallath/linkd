@@ -15,7 +15,10 @@ use sha2::Sha256;
 use crate::crc::crc32c;
 
 pub const MAGIC: [u8; 2] = *b"LK";
-pub const VERSION: u8 = 2;
+/// Bumped whenever the meaning of a header field changes. Version 3 changed the session-id layout; because session
+/// ordering is the anti-replay check, frames in an older layout must never be accepted, and the version is covered by
+/// the CRC or HMAC tag. Session ids must stay monotonic within a version.
+pub const VERSION: u8 = 3;
 pub const HEADER_LEN: usize = 27;
 pub const MAX_PAYLOAD: usize = 1024;
 pub const CRC_LEN: usize = 4;

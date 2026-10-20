@@ -55,7 +55,9 @@ Out of scope: key exchange and rotation (keys are provisioned out of band), conf
 authenticated, not encrypted), and denial of service by jamming. Anti-replay state lives in memory, so a receiver
 that has just restarted will accept the first old session it hears; closing that gap needs a nonce handshake or
 persisted state, which is the next step. Session ordering also relies on each node's clock (GPS time on a tactical
-radio); a clock that steps backwards fails closed, with the peer refusing the restarted node until its clock catches up.
+radio); a clock that steps backwards fails closed, with the peer refusing the restarted node until its clock catches up. The
+session-id layout is part of the frame version, so frames from an older layout are rejected outright; in a fielded
+system a format change would also come with a key rotation.
 
 ## Design
 
