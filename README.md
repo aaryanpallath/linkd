@@ -42,14 +42,19 @@ acknowledge frames that never arrived. With a pre-shared 256-bit link key (`Conf
 
 - **Authentication:** every frame carries an HMAC-SHA256 tag (truncated to 128 bits) over the whole frame,
   verified in constant time before any field is read or any state changes (RustCrypto `hmac` and `sha2`).
-- **Anti-replay:** each endpoint stamps frames with a fresh session id. A receiver locks onto its peer's session; a
-  new session is accepted only through a fresh first frame (a peer restart), and replaced sessions are never
-  accepted again, so recorded traffic cannot be replayed. Within a session, duplicates are suppressed.
+- **Anti-replay:** each endpoint stamps its data frames with a timestamp-ordered session id. A receiver locks onto
+  its peer's session and switches only to a *newer* session's first frame (a peer restart), so frames recorded from
+  any earlier session are refused. Within a session, duplicates are suppressed.
+- **Bound to direction:** acks carry the session they acknowledge, so an ack can only confirm the frames it was
+  written for, and an endpoint rejects any frame bearing its own session id, which stops an attacker from
+  reflecting a node's traffic back at it.
 - **Bounded state:** data frames must fall inside `[base, base + 64)`; acks for frames never sent are ignored. A
   hostile sender cannot grow receiver memory or cancel retransmissions.
 
 Out of scope: key exchange and rotation (keys are provisioned out of band), confidentiality (payloads are
-authenticated, not encrypted), and denial of service by jamming.
+authenticated, not encrypted), and denial of service by jamming. Anti-replay state lives in memory, so a receiver
+that has just restarted will accept the first old session it hears; closing that gap needs a nonce handshake or
+persisted state, which is the next step.
 
 ## Design
 
@@ -79,7 +84,7 @@ application ──send(msg, precedence)──▶ Endpoint (sans-IO state machine
 ## Build and run
 
 ```bash
-cargo test --release                       # 19 unit tests + the hostile-path UDP test
+cargo test --release                       # 23 unit tests + the hostile-path UDP test
 cargo run --release --bin linkd-bench      # scenarios above → results/bench.json
 cargo clippy --all-targets -- -D warnings  # unsafe forbidden, unwrap() denied
 ```

@@ -11,8 +11,6 @@ use crate::rng::Rng;
 /// Frames are accepted only with sequence numbers in [base, base + RECV_WINDOW), which bounds receiver state and
 /// must exceed the largest sender window plus the 32-frame selective-ack span.
 pub const RECV_WINDOW: u32 = 64;
-/// Previous peer sessions remembered so their frames can never be replayed into a newer session.
-const RETIRED_SESSIONS: usize = 64;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -28,7 +26,8 @@ pub struct Config {
     /// Pre-shared link key. With a key every frame is authenticated (HMAC-SHA256); without one, frames carry only a
     /// CRC, which detects accidental corruption but not a deliberate forgery.
     pub key: Option<LinkKey>,
-    /// This endpoint's session id; `None` picks a fresh one. It only needs to be unique, not secret.
+    /// This endpoint's session id; `None` picks a fresh one. Ids must increase across restarts (they are
+    /// timestamp-ordered), because a peer accepts only sessions newer than the one it has; they need not be secret.
     pub session: Option<u64>,
 }
 
@@ -47,14 +46,21 @@ impl Default for Config {
     }
 }
 
+/// Milliseconds since the epoch in the high 40 bits, random low bits, and strictly increasing within a process.
 fn fresh_session() -> u64 {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    static LAST: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    Rng::new(nanos ^ (std::process::id() as u64) << 32 ^ COUNTER.fetch_add(1, Ordering::Relaxed))
-        .next_u64()
+    let random = Rng::new(nanos ^ (std::process::id() as u64) << 32).next_u64() & 0xFF_FFFF;
+    let candidate = (nanos / 1_000_000) << 24 | random;
+    let prev = LAST.fetch_max(candidate, Ordering::Relaxed);
+    if candidate > prev {
+        candidate
+    } else {
+        LAST.fetch_add(1, Ordering::Relaxed) + 1
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -66,6 +72,8 @@ pub enum SendError {
 pub enum Rejected {
     Frame(FrameError),
     StaleSession,
+    /// A frame carrying this endpoint's own session: our traffic reflected back at us.
+    Reflected,
     OutsideWindow,
     AckBeyondSent,
 }
@@ -98,7 +106,6 @@ pub struct Endpoint {
     rttvar: f64,
     rto: u64,
     peer_session: Option<u64>,
-    retired_sessions: VecDeque<u64>,
     recv_base: u32,
     recv_seen: BTreeSet<u32>,
     ack_pending: bool,
@@ -121,7 +128,6 @@ impl Endpoint {
             rttvar: 0.0,
             rto,
             peer_session: None,
-            retired_sessions: VecDeque::new(),
             recv_base: 0,
             recv_seen: BTreeSet::new(),
             ack_pending: false,
@@ -172,10 +178,9 @@ impl Endpoint {
     pub fn handle(&mut self, bytes: &[u8], now: u64) -> Result<(), Rejected> {
         let result = Frame::decode(bytes, self.cfg.key.as_ref())
             .map_err(Rejected::Frame)
-            .and_then(|f| self.accept_session(&f).map(|()| f))
             .and_then(|f| match f.kind {
-                Kind::Data => self.on_data(f),
-                Kind::Ack => self.on_ack(f.ack, f.sack, now),
+                Kind::Data => self.accept_session(&f).and_then(|()| self.on_data(f)),
+                Kind::Ack => self.on_ack(&f, now),
             });
         if result.is_err() {
             self.stats.frames_rejected += 1;
@@ -183,26 +188,23 @@ impl Endpoint {
         result
     }
 
-    /// Lock onto the peer's session. A new session is accepted only through a fresh data frame with sequence number
-    /// 0 (a peer restart), and a session once replaced is never accepted again, so recorded frames cannot be replayed.
+    /// Lock onto the peer's session (data frames carry the sender's session). A new session is accepted only through
+    /// a first frame (sequence number 0) of a session newer than the current one, as after a peer restart, so frames
+    /// recorded from any earlier session cannot be replayed. Our own session coming back is a reflection.
     fn accept_session(&mut self, f: &Frame) -> Result<(), Rejected> {
+        if f.session == self.session {
+            return Err(Rejected::Reflected);
+        }
         match self.peer_session {
             None => {
                 self.peer_session = Some(f.session);
                 Ok(())
             }
             Some(s) if s == f.session => Ok(()),
-            Some(old) => {
-                let restart = f.kind == Kind::Data
-                    && f.seq == 0
-                    && !self.retired_sessions.contains(&f.session);
-                if !restart {
+            Some(current) => {
+                if f.seq != 0 || f.session < current {
                     return Err(Rejected::StaleSession);
                 }
-                if self.retired_sessions.len() == RETIRED_SESSIONS {
-                    self.retired_sessions.pop_front();
-                }
-                self.retired_sessions.push_back(old);
                 self.peer_session = Some(f.session);
                 self.recv_base = 0;
                 self.recv_seen.clear();
@@ -229,7 +231,12 @@ impl Endpoint {
         Ok(())
     }
 
-    fn on_ack(&mut self, ack: u32, sack: u32, now: u64) -> Result<(), Rejected> {
+    /// Acks carry the session they acknowledge, so an ack is only ever applied to this session's frames.
+    fn on_ack(&mut self, f: &Frame, now: u64) -> Result<(), Rejected> {
+        let (ack, sack) = (f.ack, f.sack);
+        if f.session != self.session {
+            return Err(Rejected::StaleSession);
+        }
         if ack > self.next_seq {
             return Err(Rejected::AckBeyondSent); // acknowledges frames that were never sent
         }
@@ -292,7 +299,9 @@ impl Endpoint {
                     sack |= 1 << i;
                 }
             }
-            return self.encode(&Frame::ack(self.session, self.recv_base, sack));
+            // ack_pending is only set by an accepted data frame, so the peer session is known
+            let acked_session = self.peer_session.unwrap_or_default();
+            return self.encode(&Frame::ack(acked_session, self.recv_base, sack));
         }
         // due retransmissions, highest precedence first; frames out of attempts are reported as failed
         loop {
@@ -488,8 +497,7 @@ mod tests {
             let _ = a.send(vec![i], Precedence::Routine);
             let _ = tx(&mut a, 0)?;
         }
-        let peer = 99;
-        let bogus = Frame::ack(peer, 1_000, 0)
+        let bogus = Frame::ack(a.session(), 1_000, 0)
             .encode(None)
             .map_err(Rejected::Frame)?;
         assert_eq!(a.handle(&bogus, 10), Err(Rejected::AckBeyondSent));
@@ -536,5 +544,65 @@ mod tests {
         let got: Vec<Vec<u8>> = std::iter::from_fn(|| b.poll_delivered().map(|m| m.1)).collect();
         assert_eq!(got, vec![b"old message".to_vec(), b"new message".to_vec()]);
         Ok(())
+    }
+
+    #[test]
+    fn a_never_seen_but_older_session_cannot_take_over() -> Result<(), Rejected> {
+        let key = keyed(5);
+        let mut b = Endpoint::new(key.clone());
+        let mut current = Endpoint::new(Config {
+            session: Some(20),
+            ..key.clone()
+        });
+        let _ = current.send(b"current".to_vec(), Precedence::Routine);
+        b.handle(&tx(&mut current, 0)?, 1)?;
+        // a validly tagged first frame recorded from an earlier session (e.g. a week-old capture)
+        let mut earlier = Endpoint::new(Config {
+            session: Some(10),
+            ..key
+        });
+        let _ = earlier.send(b"replayed".to_vec(), Precedence::Flash);
+        assert_eq!(
+            b.handle(&tx(&mut earlier, 0)?, 2),
+            Err(Rejected::StaleSession)
+        );
+        assert_eq!(b.stats.delivered, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn reflected_frames_are_rejected() -> Result<(), Rejected> {
+        let (mut a, mut b) = (Endpoint::new(keyed(3)), Endpoint::new(keyed(3)));
+        let _ = a.send(b"order".to_vec(), Precedence::Flash);
+        let data = tx(&mut a, 0)?;
+        // an attacker bounces a's own data frame back to a: same key, valid tag
+        assert_eq!(a.handle(&data, 5), Err(Rejected::Reflected));
+        assert!(a.poll_delivered().is_none());
+        // b's ack names a's session; reflected back to b it acknowledges nothing of b's
+        b.handle(&data, 10)?;
+        let ack = tx(&mut b, 10)?;
+        assert_eq!(b.handle(&ack, 15), Err(Rejected::StaleSession));
+        a.handle(&ack, 20)?;
+        assert!(a.is_idle());
+        Ok(())
+    }
+
+    #[test]
+    fn acks_for_another_session_are_ignored() -> Result<(), Rejected> {
+        let mut a = Endpoint::new(keyed(4));
+        let _ = a.send(b"x".to_vec(), Precedence::Routine);
+        let _ = tx(&mut a, 0)?;
+        let other = Frame::ack(a.session() ^ 1, 1, 0)
+            .encode(Some(&LinkKey::new([4; 32])))
+            .map_err(Rejected::Frame)?;
+        assert_eq!(a.handle(&other, 10), Err(Rejected::StaleSession));
+        assert!(!a.is_idle());
+        Ok(())
+    }
+
+    #[test]
+    fn fresh_sessions_strictly_increase() {
+        let ids: Vec<u64> = (0..1000).map(|_| fresh_session()).collect();
+        assert!(ids.windows(2).all(|w| w[0] < w[1]));
     }
 }
