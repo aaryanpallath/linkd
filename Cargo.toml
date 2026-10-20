@@ -1,0 +1,19 @@
+[package]
+name = "linkd"
+version = "0.1.0"
+edition = "2024"
+description = "Reliable, precedence-aware messaging over lossy tactical links: sans-IO protocol core, deterministic simulator, UDP runtime"
+license = "MIT"
+
+[dependencies]
+
+[[bin]]
+name = "linkd-bench"
+path = "src/bin/bench.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "warn"
